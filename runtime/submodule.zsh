@@ -23,6 +23,7 @@ Query commands:
 Operation commands:
   sync <parent> <name-or-path>
   init <parent> <name-or-path> [filter]
+  init-remote-branch <parent> <name-or-path> <branch> [filter]
   fetch <parent> <name-or-path> <remote>
   checkout-remote-branch <parent> <name-or-path> <remote> <branch>
   reset-remote-branch <parent> <name-or-path> <remote> <branch>
@@ -262,6 +263,29 @@ submodule_init() {
   git -C "${parent_root}" -c fetch.recurseSubmodules=false "${arguments[@]}"
 }
 
+submodule_init_remote_branch() {
+  local parent="${1:-}" input="${2:-}" branch="${3:-}" filter="${4:-}"
+  local context parent_root submodule_path submodule_name
+  local -a arguments
+
+  _submodule_check_argument_count "submodule_init_remote_branch" 3 4 "$#" \
+    "<parent> <name-or-path> <branch> [filter]" || return 1
+  context="$(_submodule_resolve_context "${parent}" "${input}")" || return 1
+  parent_root="${context%%$'\t'*}"
+  submodule_path="${context#*$'\t'}"
+  submodule_name="$(_submodule_name_for_path "${parent_root}" "${submodule_path}")" || return 1
+  _submodule_validate_branch "${branch}" || return 1
+
+  submodule_sync "${parent_root}" "${submodule_path}" || return 1
+  arguments=(submodule update --init --remote)
+  [[ -n "${filter}" ]] && arguments+=("--filter=${filter}")
+  arguments+=(-- "${submodule_path}")
+  git -C "${parent_root}" \
+    -c fetch.recurseSubmodules=false \
+    -c "submodule.${submodule_name}.branch=${branch}" \
+    "${arguments[@]}"
+}
+
 submodule_fetch() {
   local context parent_root submodule_path repo_path remote="${3:-}"
 
@@ -476,6 +500,9 @@ _submodule_main() {
       ;;
     init)
       submodule_init "$@"
+      ;;
+    init-remote-branch)
+      submodule_init_remote_branch "$@"
       ;;
     fetch)
       submodule_fetch "$@"
