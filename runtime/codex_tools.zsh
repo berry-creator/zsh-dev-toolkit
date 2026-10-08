@@ -28,16 +28,15 @@ codex_tools_configure_custom_provider() {
 
   perl -0pi -e '
     s/^# BEGIN configure_codex\n.*?^# END configure_codex\n{0,2}//msg;
-    s/^(model|model_reasoning_error|approval_policy|sandbox_mode|allow_login_shell|requires_openai_auth|model_provider)\s*=.*\n//mg;
+    s/^(model|model_reasoning_effort|approval_policy|sandbox_mode|allow_login_shell|requires_openai_auth|model_provider)\s*=.*\n//mg;
     s/^\[model_providers\.custom\]\n(?:(?!^\[).*\n)*//mg;
   ' ~/.codex/config.toml
 
   local codex_base_config
   codex_base_config="$(cat <<EOF
 # BEGIN configure_codex
-model = "gpt-5.6-sol"
-model_reasoning_effort = "high"
-model_reasoning_error = "high"
+model = "gpt-6.1-sol"
+model_reasoning_effort = "medium"
 
 approval_policy = "never"
 sandbox_mode = "danger-full-access"
