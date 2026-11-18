@@ -32,18 +32,18 @@ zsh /path/to/zsh-dev-toolkit/runtime/devcontainer_state.zsh restore
 ```
 
 Configure paths in `runtime/devcontainer_state.conf`, one absolute path or
-`~/path` per line. Add optional tab-separated GNU tar exclusion patterns after
-the path to omit matching file names, extensions, or directories:
+`~/path` per line. Add zero or more `--exclude <glob>` options to omit matching
+file names, extensions, or directories:
 
 ```text
-~/.codex<TAB>*.log<TAB>plugins
+"~/.codex with spaces" --exclude '*.log' --exclude plugins
 ```
 
-In this example, replace each `<TAB>` marker with a literal tab character.
-Patterns use GNU tar's exclude glob behavior and apply recursively within that
-configured path. Excluded files are not included in the backup. If you choose
-to overwrite an existing target during restore, the entire target path is
-still replaced, so excluded files in that target are not preserved.
+Quote paths or patterns containing spaces using shell-style quotes. Patterns
+use GNU tar's exclude glob behavior and apply recursively within that configured
+path. Excluded files are not included in the backup. If you choose to overwrite
+an existing target during restore, the entire target path is still replaced,
+so excluded files in that target are not preserved.
 
 Backups are temporarily stored in
 `.devcontainer-state-backup` at the Git workspace root. Add this directory to

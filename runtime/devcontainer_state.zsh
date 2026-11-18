@@ -101,10 +101,10 @@ _devcontainer_state_resolve_path() {
 }
 
 _devcontainer_state_read_config() {
-  local config_line configured_path resolved_path existing_path remainder pattern more_fields
+  local config_line configured_path resolved_path existing_path pattern option_index
   local exclude_offset
   local -a resolved_paths resolved_exclude_patterns resolved_exclude_counts
-  local -a resolved_exclude_offsets line_exclude_patterns
+  local -a resolved_exclude_offsets line_exclude_patterns config_fields
 
   if [[ ! -r "${_devcontainer_state_config}" ]]; then
     log_error "Configuration file not found or unreadable: ${_devcontainer_state_config}"
@@ -113,30 +113,32 @@ _devcontainer_state_read_config() {
 
   while IFS= read -r config_line || [[ -n "${config_line}" ]]; do
     [[ -z "${config_line}" || "${config_line}" == \#* ]] && continue
-    configured_path="${config_line%%$'\t'*}"
+    config_fields=("${(@Q)${(@z)config_line}}")
+    if (( ${#config_fields[@]} == 0 )); then
+      continue
+    fi
+    configured_path="${config_fields[1]}"
     resolved_path="$(_devcontainer_state_resolve_path "${configured_path}")" || return 1
     line_exclude_patterns=()
 
-    if [[ "${config_line}" == *$'\t'* ]]; then
-      remainder="${config_line#*$'\t'}"
-      while true; do
-        if [[ "${remainder}" == *$'\t'* ]]; then
-          pattern="${remainder%%$'\t'*}"
-          remainder="${remainder#*$'\t'}"
-          more_fields=true
-        else
-          pattern="${remainder}"
-          more_fields=false
-        fi
+    option_index=2
+    while (( option_index <= ${#config_fields[@]} )); do
+      if [[ "${config_fields[option_index]}" != "--exclude" ]]; then
+        log_error "Unknown configuration option for ${configured_path}: ${config_fields[option_index]}"
+        return 1
+      fi
+      option_index=$((option_index + 1))
 
-        if [[ -z "${pattern}" ]]; then
-          log_error "Empty exclusion pattern for: ${configured_path}"
-          return 1
-        fi
-        line_exclude_patterns+=("${pattern}")
-        [[ "${more_fields}" == true ]] || break
-      done
-    fi
+      if (( option_index > ${#config_fields[@]} )) ||
+        [[ -z "${config_fields[option_index]}" ]]; then
+        log_error "Missing exclusion pattern for: ${configured_path}"
+        return 1
+      fi
+
+      pattern="${config_fields[option_index]}"
+      line_exclude_patterns+=("${pattern}")
+      option_index=$((option_index + 1))
+    done
 
     for existing_path in "${resolved_paths[@]}"; do
       if [[ "${existing_path}" == "${resolved_path}" ]]; then
