@@ -7,7 +7,7 @@ unset _devcontainer_state_script_dir
 
 _devcontainer_state_help() {
   cat <<'EOF'
-Usage: devcontainer_state.zsh <backup|restore>
+Usage: devcontainer_state.zsh <backup [--recreate]|restore>
        . /path/to/devcontainer_state.zsh
 
 Back up configured files before rebuilding a Dev Container, then restore them
@@ -15,7 +15,8 @@ after rebuilding. The configuration is devcontainer_state.conf beside this
 script. List one absolute path or ~/path per line.
 
 Commands:
-  backup                 Back up configured paths to the Git workspace
+  backup [--recreate]    Back up configured paths to the Git workspace
+                         Replace an existing backup only with --recreate
   restore                Restore paths from the workspace backup
   -h, --help             Show this help
 
@@ -149,12 +150,15 @@ _devcontainer_state_backup_confirm() {
 }
 
 devcontainer_state_backup() {
-  local workspace_root backup_dir manifest source_path item_id item_dir payload
+  local workspace_root backup_dir staging_dir previous_dir manifest source_path item_id item_dir payload
   local du_output size_kb copied=0 skipped=0 index=0
+  local recreate=false
   local -a _devcontainer_state_paths approved_paths
 
-  if (( $# != 0 )); then
-    log_error "Usage: devcontainer_state_backup"
+  if (( $# == 1 )) && [[ "$1" == "--recreate" ]]; then
+    recreate=true
+  elif (( $# != 0 )); then
+    log_error "Usage: devcontainer_state_backup [--recreate]"
     return 1
   fi
 
@@ -164,8 +168,14 @@ devcontainer_state_backup() {
   manifest="${backup_dir}/manifest.tsv"
 
   if [[ -e "${backup_dir}" || -L "${backup_dir}" ]]; then
-    log_error "A backup already exists: ${backup_dir}"
-    return 1
+    if [[ "${recreate}" != true ]]; then
+      log_error "A backup already exists: ${backup_dir} (use --recreate to replace it)"
+      return 1
+    fi
+    if [[ ! -d "${backup_dir}" || -L "${backup_dir}" ]]; then
+      log_error "Existing backup is not a directory: ${backup_dir}"
+      return 1
+    fi
   fi
 
   for source_path in "${_devcontainer_state_paths[@]}"; do
@@ -206,11 +216,18 @@ devcontainer_state_backup() {
     return 1
   fi
 
-  mkdir -p "${backup_dir}/items" || {
-    log_error "Unable to create backup directory: ${backup_dir}"
+  staging_dir="$(mktemp -d "${workspace_root}/.devcontainer-state-backup.XXXXXX")" || {
+    log_error "Unable to create a temporary backup directory in: ${workspace_root}"
+    return 1
+  }
+  manifest="${staging_dir}/manifest.tsv"
+  mkdir -p "${staging_dir}/items" || {
+    rm -rf -- "${staging_dir}"
+    log_error "Unable to create backup directory: ${staging_dir}"
     return 1
   }
   : > "${manifest}" || {
+    rm -rf -- "${staging_dir}"
     log_error "Unable to create backup manifest: ${manifest}"
     return 1
   }
@@ -218,22 +235,23 @@ devcontainer_state_backup() {
   for source_path in "${approved_paths[@]}"; do
     index=$((index + 1))
     item_id="$(printf '%06d' "${index}")"
-    item_dir="${backup_dir}/items/${item_id}"
+    item_dir="${staging_dir}/items/${item_id}"
     payload="${item_dir}/payload"
 
     mkdir -p "${item_dir}" || {
+      rm -rf -- "${staging_dir}"
       log_error "Unable to prepare backup for: ${source_path}"
       return 1
     }
 
     if ! cp -a -- "${source_path}" "${payload}"; then
-      rm -rf -- "${item_dir}"
+      rm -rf -- "${staging_dir}"
       log_error "Unable to back up: ${source_path}"
       return 1
     fi
 
     if ! printf '%s\t%s\n' "${item_id}" "${source_path}" >> "${manifest}"; then
-      rm -rf -- "${item_dir}"
+      rm -rf -- "${staging_dir}"
       log_error "Unable to record backup for: ${source_path}"
       return 1
     fi
@@ -243,7 +261,48 @@ devcontainer_state_backup() {
   done
 
   if (( copied == 0 )); then
-    rm -rf -- "${backup_dir}"
+    rm -rf -- "${staging_dir}"
+    log_warn "[partial] backed up 0, skipped ${skipped}"
+    return 1
+  fi
+
+  if [[ ( -e "${backup_dir}" || -L "${backup_dir}" ) && "${recreate}" != true ]]; then
+    rm -rf -- "${staging_dir}"
+    log_error "A backup appeared during this operation: ${backup_dir}"
+    return 1
+  fi
+
+  if [[ -e "${backup_dir}" || -L "${backup_dir}" ]]; then
+    previous_dir="$(mktemp -d "${workspace_root}/.devcontainer-state-backup.previous.XXXXXX")" || {
+      rm -rf -- "${staging_dir}"
+      log_error "Unable to prepare replacement of existing backup."
+      return 1
+    }
+    rmdir "${previous_dir}" || {
+      rm -rf -- "${staging_dir}" "${previous_dir}"
+      log_error "Unable to prepare replacement of existing backup."
+      return 1
+    }
+    if ! mv -- "${backup_dir}" "${previous_dir}"; then
+      rm -rf -- "${staging_dir}"
+      log_error "Unable to move existing backup out of the way: ${backup_dir}"
+      return 1
+    fi
+  fi
+
+  if ! mv -- "${staging_dir}" "${backup_dir}"; then
+    if [[ -n "${previous_dir}" ]]; then
+      mv -- "${previous_dir}" "${backup_dir}" ||
+        log_error "Unable to restore the previous backup: ${backup_dir}"
+    fi
+    rm -rf -- "${staging_dir}"
+    log_error "Unable to install new backup: ${backup_dir}"
+    return 1
+  fi
+
+  if [[ -n "${previous_dir}" ]] && ! rm -rf -- "${previous_dir}"; then
+    log_error "New backup was created, but the previous backup could not be removed: ${previous_dir}"
+    return 1
   fi
 
   if (( skipped > 0 )); then

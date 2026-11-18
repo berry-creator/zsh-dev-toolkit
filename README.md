@@ -22,6 +22,9 @@ Before rebuilding a Dev Container, run:
 zsh /path/to/zsh-dev-toolkit/runtime/devcontainer_state.zsh backup
 ```
 
+If a backup already exists, use `backup --recreate` to create a fresh backup
+and replace the previous one after the new backup has been prepared.
+
 After rebuilding, run:
 
 ```zsh
