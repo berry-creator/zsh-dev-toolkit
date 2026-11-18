@@ -11,5 +11,6 @@ _init_script_dir="${${(%):-%N}:A:h}"
 . "${_init_script_dir}/sync_remote_tags.zsh"
 . "${_init_script_dir}/sync_remote_branches.zsh"
 . "${_init_script_dir}/rebase_branches.zsh"
+. "${_init_script_dir}/devcontainer_state.zsh"
 
 unset _init_script_dir
