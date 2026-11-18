@@ -12,7 +12,8 @@ Usage: devcontainer_state.zsh <backup [--recreate]|restore>
 
 Back up configured files before rebuilding a Dev Container, then restore them
 after rebuilding. The configuration is devcontainer_state.conf beside this
-script. List one absolute path or ~/path per line.
+script. List one absolute path or ~/path per line. Optional tab-separated
+fields after the path are GNU tar exclusion patterns.
 
 Commands:
   backup [--recreate]    Back up configured paths to the Git workspace
@@ -21,7 +22,9 @@ Commands:
   -h, --help             Show this help
 
 Large paths over 100 MiB require confirmation. Existing restore targets
-require a per-path choice. Interactive confirmation requires a terminal.
+require a per-path choice. GNU tar is required. Backups are sparse tar.gz
+archives with ACL and extended-attribute support. Interactive confirmation
+requires a terminal.
 EOF
 }
 
@@ -34,6 +37,24 @@ _devcontainer_state_workspace_root() {
   }
 
   printf '%s\n' "${root}"
+}
+
+_devcontainer_state_require_gnu_tar() {
+  local version
+
+  if ! command -v tar >/dev/null 2>&1; then
+    log_error "GNU tar is required for Dev Container state backups."
+    return 1
+  fi
+
+  version="$(tar --version 2>/dev/null)" || {
+    log_error "Unable to determine the tar implementation."
+    return 1
+  }
+  if [[ "${version}" != "tar (GNU tar)"* ]]; then
+    log_error "GNU tar is required for Dev Container state backups."
+    return 1
+  fi
 }
 
 _devcontainer_state_path_overlaps_backup() {
@@ -80,18 +101,42 @@ _devcontainer_state_resolve_path() {
 }
 
 _devcontainer_state_read_config() {
-  local configured_path resolved_path
-  local existing_path
-  local -a resolved_paths
+  local config_line configured_path resolved_path existing_path remainder pattern more_fields
+  local exclude_offset
+  local -a resolved_paths resolved_exclude_patterns resolved_exclude_counts
+  local -a resolved_exclude_offsets line_exclude_patterns
 
   if [[ ! -r "${_devcontainer_state_config}" ]]; then
     log_error "Configuration file not found or unreadable: ${_devcontainer_state_config}"
     return 1
   fi
 
-  while IFS= read -r configured_path || [[ -n "${configured_path}" ]]; do
-    [[ -z "${configured_path}" || "${configured_path}" == \#* ]] && continue
+  while IFS= read -r config_line || [[ -n "${config_line}" ]]; do
+    [[ -z "${config_line}" || "${config_line}" == \#* ]] && continue
+    configured_path="${config_line%%$'\t'*}"
     resolved_path="$(_devcontainer_state_resolve_path "${configured_path}")" || return 1
+    line_exclude_patterns=()
+
+    if [[ "${config_line}" == *$'\t'* ]]; then
+      remainder="${config_line#*$'\t'}"
+      while true; do
+        if [[ "${remainder}" == *$'\t'* ]]; then
+          pattern="${remainder%%$'\t'*}"
+          remainder="${remainder#*$'\t'}"
+          more_fields=true
+        else
+          pattern="${remainder}"
+          more_fields=false
+        fi
+
+        if [[ -z "${pattern}" ]]; then
+          log_error "Empty exclusion pattern for: ${configured_path}"
+          return 1
+        fi
+        line_exclude_patterns+=("${pattern}")
+        [[ "${more_fields}" == true ]] || break
+      done
+    fi
 
     for existing_path in "${resolved_paths[@]}"; do
       if [[ "${existing_path}" == "${resolved_path}" ]]; then
@@ -100,6 +145,10 @@ _devcontainer_state_read_config() {
       fi
     done
     resolved_paths+=("${resolved_path}")
+    resolved_exclude_counts+=("${#line_exclude_patterns[@]}")
+    exclude_offset=$(( ${#resolved_exclude_patterns[@]} + 1 ))
+    resolved_exclude_offsets+=("${exclude_offset}")
+    resolved_exclude_patterns+=("${line_exclude_patterns[@]}")
   done < "${_devcontainer_state_config}"
 
   if (( ${#resolved_paths[@]} == 0 )); then
@@ -108,6 +157,9 @@ _devcontainer_state_read_config() {
   fi
 
   _devcontainer_state_paths=("${resolved_paths[@]}")
+  _devcontainer_state_exclude_counts=("${resolved_exclude_counts[@]}")
+  _devcontainer_state_exclude_offsets=("${resolved_exclude_offsets[@]}")
+  _devcontainer_state_exclude_patterns=("${resolved_exclude_patterns[@]}")
 }
 
 _devcontainer_state_read_tty() {
@@ -150,10 +202,11 @@ _devcontainer_state_backup_confirm() {
 }
 
 devcontainer_state_backup() {
-  local workspace_root backup_dir staging_dir previous_dir manifest source_path item_id item_dir payload
-  local du_output size_kb copied=0 skipped=0 index=0
+  local workspace_root backup_dir staging_dir previous_dir manifest source_path item_id payload
+  local du_output size_kb copied=0 skipped=0 index=0 exclude_count exclude_offset pattern_index path_index
   local recreate=false
-  local -a _devcontainer_state_paths approved_paths
+  local -a _devcontainer_state_paths _devcontainer_state_exclude_counts _devcontainer_state_exclude_offsets
+  local -a _devcontainer_state_exclude_patterns approved_path_indexes tar_excludes
 
   if (( $# == 1 )) && [[ "$1" == "--recreate" ]]; then
     recreate=true
@@ -164,6 +217,7 @@ devcontainer_state_backup() {
 
   _devcontainer_state_read_config || return 1
   workspace_root="$(_devcontainer_state_workspace_root)" || return 1
+  _devcontainer_state_require_gnu_tar || return 1
   backup_dir="${workspace_root}/.devcontainer-state-backup"
   manifest="${backup_dir}/manifest.tsv"
 
@@ -178,7 +232,9 @@ devcontainer_state_backup() {
     fi
   fi
 
-  for source_path in "${_devcontainer_state_paths[@]}"; do
+  for (( path_index = 1; path_index <= ${#_devcontainer_state_paths[@]}; path_index++ )); do
+    source_path="${_devcontainer_state_paths[path_index]}"
+
     if _devcontainer_state_path_overlaps_backup "${source_path}" "${backup_dir}"; then
       log_error "Configured path overlaps the workspace backup directory: ${source_path}"
       return 1
@@ -208,10 +264,16 @@ devcontainer_state_backup() {
         continue
       fi
     fi
-    approved_paths+=("${source_path}")
+    approved_path_indexes+=("${path_index}")
   done
 
-  if (( ${#approved_paths[@]} == 0 )); then
+  if (( skipped > 0 )) &&
+    [[ "${recreate}" == true && ( -e "${backup_dir}" || -L "${backup_dir}" ) ]]; then
+    log_error "Incomplete replacement; the existing backup was left unchanged."
+    return 1
+  fi
+
+  if (( ${#approved_path_indexes[@]} == 0 )); then
     log_warn "[partial] backed up 0, skipped ${skipped}"
     return 1
   fi
@@ -232,21 +294,23 @@ devcontainer_state_backup() {
     return 1
   }
 
-  for source_path in "${approved_paths[@]}"; do
+  for path_index in "${approved_path_indexes[@]}"; do
+    source_path="${_devcontainer_state_paths[path_index]}"
     index=$((index + 1))
     item_id="$(printf '%06d' "${index}")"
-    item_dir="${staging_dir}/items/${item_id}"
-    payload="${item_dir}/payload"
+    payload="${staging_dir}/items/${item_id}.tar.gz"
+    exclude_count="${_devcontainer_state_exclude_counts[path_index]}"
+    exclude_offset="${_devcontainer_state_exclude_offsets[path_index]}"
+    tar_excludes=()
+    for (( pattern_index = exclude_offset; pattern_index < exclude_offset + exclude_count; pattern_index++ )); do
+      tar_excludes+=("--exclude=${_devcontainer_state_exclude_patterns[pattern_index]}")
+    done
 
-    mkdir -p "${item_dir}" || {
+    if ! tar --create --gzip --file="${payload}" --sparse --acls --xattrs \
+      "${tar_excludes[@]}" \
+      --directory="${source_path:h}" -- "${source_path:t}"; then
       rm -rf -- "${staging_dir}"
       log_error "Unable to prepare backup for: ${source_path}"
-      return 1
-    }
-
-    if ! cp -a -- "${source_path}" "${payload}"; then
-      rm -rf -- "${staging_dir}"
-      log_error "Unable to back up: ${source_path}"
       return 1
     fi
 
@@ -364,47 +428,95 @@ _devcontainer_state_restore_one() {
   local backup_dir="$1"
   local item_id="$2"
   local target_path="$3"
-  local payload
-  local stage_dir staged_path replaced_path=""
+  local archive="${backup_dir}/items/${item_id}.tar.gz"
+  local legacy_payload="${backup_dir}/items/${item_id}/payload"
+  local legacy_archive=""
+  local item_backup="${backup_dir}/items/${item_id}"
+  local stage_dir staged_path replaced_dir replaced_path expected_entry cleanup_dir cleanup_item original_item
+  local legacy=false
+  local -a staged_entries
   local had_target=false
 
-  payload="${backup_dir}/items/${item_id}/payload"
-  if [[ ! -e "${payload}" && ! -L "${payload}" ]]; then
-    log_error "Backup data is missing for: ${target_path}"
-    return 1
-  fi
-
-  replaced_path="${backup_dir}/replaced/${item_id}"
-  if [[ -e "${replaced_path}" || -L "${replaced_path}" ]]; then
-    log_error "A previous target backup needs attention: ${replaced_path}"
+  if [[ -e "${archive}" || -L "${archive}" ]]; then
+    if [[ ! -f "${archive}" || -L "${archive}" ]]; then
+      log_error "Backup archive is invalid for: ${target_path}"
+      return 1
+    fi
+    if ! tar --list --gzip --file="${archive}" >/dev/null; then
+      log_error "Backup archive is corrupt or unreadable for: ${target_path}"
+      return 1
+    fi
+    expected_entry="${target_path:t}"
+  elif [[ -e "${legacy_payload}" || -L "${legacy_payload}" ]]; then
+    legacy_archive="$(mktemp "${backup_dir}/.legacy-${item_id}.XXXXXX")" || {
+      log_error "Unable to prepare legacy backup for: ${target_path}"
+      return 1
+    }
+    archive="${legacy_archive}"
+    legacy=true
+    if ! tar --create --gzip --file="${archive}" --sparse --acls --xattrs \
+      --directory="${legacy_payload:h}" -- "${legacy_payload:t}"; then
+      rm -f -- "${archive}"
+      log_error "Unable to prepare legacy backup for: ${target_path}"
+      return 1
+    fi
+    if ! tar --list --gzip --file="${archive}" >/dev/null; then
+      rm -f -- "${archive}"
+      log_error "Legacy backup is corrupt or unreadable for: ${target_path}"
+      return 1
+    fi
+    expected_entry="${legacy_payload:t}"
+  else
+    log_error "Backup archive is missing for: ${target_path}"
     return 1
   fi
 
   mkdir -p -- "${target_path:h}" || {
+    [[ "${legacy}" == true ]] && rm -f -- "${archive}"
     log_error "Unable to create target directory: ${target_path:h}"
     return 1
   }
 
   stage_dir="$(mktemp -d "${target_path:h}/.devcontainer-state.XXXXXX")" || {
+    [[ "${legacy}" == true ]] && rm -f -- "${archive}"
     log_error "Unable to prepare restore for: ${target_path}"
     return 1
   }
-  staged_path="${stage_dir}/${target_path:t}"
 
-  if ! cp -a -- "${payload}" "${staged_path}"; then
+  if ! tar --extract --gzip --file="${archive}" --sparse --acls --xattrs \
+    --no-same-owner --same-permissions --directory="${stage_dir}"; then
     rm -rf -- "${stage_dir}"
+    [[ "${legacy}" == true ]] && rm -f -- "${archive}"
     log_error "Unable to prepare restored data for: ${target_path}"
     return 1
   fi
+  if [[ "${legacy}" == true ]] && ! rm -f -- "${archive}"; then
+    rm -rf -- "${stage_dir}"
+    log_error "Unable to remove temporary legacy archive: ${archive}"
+    return 1
+  fi
+
+  staged_entries=("${stage_dir}"/*(DN))
+  if (( ${#staged_entries[@]} != 1 )) ||
+    [[ "${staged_entries[1]:t}" != "${expected_entry}" ]]; then
+    rm -rf -- "${stage_dir}"
+    [[ "${legacy}" == true ]] && rm -f -- "${archive}"
+    log_error "Backup archive contains unexpected paths for: ${target_path}"
+    return 1
+  fi
+  staged_path="${staged_entries[1]}"
 
   if [[ -e "${target_path}" || -L "${target_path}" ]]; then
-    mkdir -p "${replaced_path:h}" || {
+    replaced_dir="$(mktemp -d "${target_path:h}/.devcontainer-state-replaced.XXXXXX")" || {
       rm -rf -- "${stage_dir}"
+      [[ "${legacy}" == true ]] && rm -f -- "${archive}"
       log_error "Unable to prepare replacement for: ${target_path}"
       return 1
     }
+    replaced_path="${replaced_dir}/target"
     if ! mv -- "${target_path}" "${replaced_path}"; then
-      rm -rf -- "${stage_dir}"
+      rm -rf -- "${stage_dir}" "${replaced_dir}"
+      [[ "${legacy}" == true ]] && rm -f -- "${archive}"
       log_error "Unable to move existing target out of the way: ${target_path}"
       return 1
     fi
@@ -413,27 +525,59 @@ _devcontainer_state_restore_one() {
 
   if ! mv -- "${staged_path}" "${target_path}"; then
     if [[ "${had_target}" == true ]]; then
-      mv -- "${replaced_path}" "${target_path}" ||
+      if ! mv -- "${replaced_path}" "${target_path}"; then
         log_error "Unable to restore the previous target: ${target_path}"
+        log_error "The previous target was retained at: ${replaced_path}"
+        [[ "${legacy}" == true ]] && rm -f -- "${archive}"
+        return 1
+      fi
     fi
-    rm -rf -- "${stage_dir}"
+    rm -rf -- "${stage_dir}" "${replaced_dir}"
+    [[ "${legacy}" == true ]] && rm -f -- "${archive}"
     log_error "Unable to install restored data at: ${target_path}"
     return 1
   fi
 
-  rmdir "${stage_dir}" 2>/dev/null
-
-  if [[ "${had_target}" == true ]] && ! rm -rf -- "${replaced_path}"; then
-    log_error "Restored data, but could not remove the replaced target backup: ${replaced_path}"
+  if ! rm -rf -- "${stage_dir}"; then
+    log_error "Restored data, but could not remove temporary restore data: ${stage_dir}"
+    [[ "${legacy}" == true ]] && rm -f -- "${archive}"
+    return 1
+  fi
+  if [[ -n "${replaced_dir}" ]] && ! rm -rf -- "${replaced_dir}"; then
+    log_error "Restored data, but could not remove the previous target at: ${replaced_dir}"
+    [[ "${legacy}" == true ]] && rm -f -- "${archive}"
     return 1
   fi
 
-  _devcontainer_state_remove_manifest_entry \
-    "${backup_dir}/manifest.tsv" "${item_id}" || return 1
-  rm -rf -- "${backup_dir}/items/${item_id}" || {
-    log_error "Restored data, but could not remove its backup: ${target_path}"
+  cleanup_dir="$(mktemp -d "${backup_dir}/.restored-${item_id}.XXXXXX")" || {
+    log_error "Restored data, but could not prepare backup cleanup: ${target_path}"
     return 1
   }
+  cleanup_item="${cleanup_dir}/item"
+  if [[ "${legacy}" == true ]]; then
+    original_item="${item_backup}"
+  else
+    original_item="${archive}"
+  fi
+
+  if ! mv -- "${original_item}" "${cleanup_item}"; then
+    rmdir "${cleanup_dir}" 2>/dev/null
+    log_error "Restored data, but could not stage its backup for cleanup: ${target_path}"
+    return 1
+  fi
+
+  if ! _devcontainer_state_remove_manifest_entry \
+    "${backup_dir}/manifest.tsv" "${item_id}"; then
+    if ! mv -- "${cleanup_item}" "${original_item}"; then
+      log_error "Could not return backup data to its original location: ${original_item}"
+    fi
+    rmdir "${cleanup_dir}" 2>/dev/null
+    return 1
+  fi
+
+  if ! rm -rf -- "${cleanup_dir}"; then
+    log_warn "Restored data, but could not remove temporary backup cleanup data: ${cleanup_dir}"
+  fi
 
   log_success "[restore] ${target_path}"
 }
@@ -450,6 +594,7 @@ devcontainer_state_restore() {
   fi
 
   workspace_root="$(_devcontainer_state_workspace_root)" || return 1
+  _devcontainer_state_require_gnu_tar || return 1
   backup_dir="${workspace_root}/.devcontainer-state-backup"
   manifest="${backup_dir}/manifest.tsv"
 
