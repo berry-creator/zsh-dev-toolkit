@@ -32,17 +32,20 @@ codex_tools_configure_custom_provider() {
     s/^\[model_providers\.custom\]\n(?:(?!^\[).*\n)*//mg;
   ' ~/.codex/config.toml
 
+  if [ ! -s ~/.codex/config.toml ]; then
+    printf '\n' > ~/.codex/config.toml
+  fi
+
   local codex_base_config
   codex_base_config="$(cat <<EOF
 # BEGIN configure_codex
 model = "gpt-6.1-sol"
-model_reasoning_effort = "medium"
+model_reasoning_effort = "high"
 
 approval_policy = "never"
 sandbox_mode = "danger-full-access"
 
 allow_login_shell = false
-requires_openai_auth = false
 
 model_provider = "custom"
 

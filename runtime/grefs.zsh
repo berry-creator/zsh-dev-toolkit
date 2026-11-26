@@ -12,6 +12,7 @@ grefs() {
   local arg line
   local short_ref full_ref object_name author_name commit_date subject
   local base counts behind ahead compare_cols has_ahead has_behind all_same sort_key
+  local hash_width=7 hash_value
   local sort_spec="date:desc"
   local sort_col="date"
   local sort_dir="desc"
@@ -166,8 +167,14 @@ EOF
       ;;
   esac
 
-  printf '%-30s | %-7s | %-10s | %-10s | %-18s | %s\n' "REF" "HASH" "AUTHOR" "DATE" "AHEAD/BEHIND" "SUBJECT"
-  printf '%s\n' "------------------------------ | ------- | ---------- | ---------- | ------------------ | -------"
+  while IFS= read -r hash_value; do
+    if [ "${#hash_value}" -gt "${hash_width}" ]; then
+      hash_width="${#hash_value}"
+    fi
+  done < <(git for-each-ref --format='%(objectname:short)' "${ref_roots[@]}")
+
+  printf '%-30s | %-'"${hash_width}"'s | %-10s | %-10s | %-18s | %s\n' "REF" "HASH" "AUTHOR" "DATE" "AHEAD/BEHIND" "SUBJECT"
+  printf '%s\n' "------------------------------ | $(printf '%*s' "${hash_width}" '' | tr ' ' '-') | ---------- | ---------- | ------------------ | -------"
 
   git for-each-ref \
     --sort=-committerdate \
@@ -210,7 +217,7 @@ EOF
         continue
       fi
 
-      line="$(printf '%-30s | %-7s | %-10s | %-10s%s | %s' "${short_ref}" "${object_name}" "${author_name}" "${commit_date}" "${compare_cols}" "${subject}")"
+      line="$(printf '%-30s | %-'"${hash_width}"'s | %-10s | %-10s%s | %s' "${short_ref}" "${object_name}" "${author_name}" "${commit_date}" "${compare_cols}" "${subject}")"
 
       for arg in "${keywords[@]}"; do
         if ! printf '%s\n' "${line}" | grep -i -- "${arg}" >/dev/null; then
